@@ -98,15 +98,42 @@ def preprocess_data(raw_data):
         df = df.dropna(subset=["reviewerID", "reviewText", "overall"])
         df = df[df["reviewText"].str.len() >= config.MIN_REVIEW_LENGTH].reset_index(drop=True)
         if len(df) < 10:
-            logger.warning(f"{platform}平台有效样本不足10条，跳过")
+            logger.warning(f"{platform}平台有效样本不足 10 条，跳过")
             continue
 
-        # 构建目标变量
-        df = df[df["overall"].isin([1.0, 2.0, 4.0, 5.0])].reset_index(drop=True)
+        # ========== 新增：根据不同平台构建不同的目标变量（实现目标异构） ==========
+        target_type = config.PLATFORM_CONFIG[platform]["target"]
+        
+        if target_type == "CTR":
+            # Books 平台：CTR - 模拟点击行为
+            # 假设：长评论 + 高分 = 深度点击/兴趣
+            # 策略 1：评论长度 > 200 字符且评分>=4 为正样本
+            df["target"] = ((df["reviewText"].str.len() > 200) & (df["overall"] >= 4.0)).astype(int)
+            logger.info(f"{platform}平台使用 CTR 目标：长评论 (>200) 且高分 (≥4) → 正样本")
+            
+        elif target_type == "CVR":
+            # Electronics 平台：CVR - 模拟转化行为
+            # 策略：仅 5 星评为正样本（严格转化标准）
+            df["target"] = (df["overall"] >= 5.0).astype(int)
+            logger.info(f"{platform}平台使用 CVR 目标：仅 5 星评→正样本（严格转化）")
+            
+        elif target_type == "Interaction":
+            # Clothing 平台：Interaction - 模拟交互行为
+            # 策略：helpful 投票数>0 或评分>=4 为正样本
+            df["helpful_votes"] = df["helpful"].apply(lambda x: x[0] if isinstance(x, list) and len(x) > 0 else 0)
+            df["target"] = ((df["helpful_votes"] > 0) | (df["overall"] >= 4.0)).astype(int)
+            logger.info(f"{platform}平台使用 Interaction 目标：有帮助投票或高分 (≥4) → 正样本")
+            
+        else:
+            # 默认策略：使用原始评分阈值
+            df = df[df["overall"].isin([1.0, 2.0, 4.0, 5.0])].reset_index(drop=True)
+            df["target"] = (df["overall"] >= 4.0).astype(int)
+            logger.info(f"{platform}平台使用默认目标：评分≥4→正样本")
+        
+        # 过滤无效目标
         if len(df) == 0:
             logger.warning(f"{platform}平台无有效正负样本，跳过")
             continue
-        df["target"] = (df["overall"] >= 4.0).astype(int)
 
         # 特征工程
         df["text_features"] = df["reviewText"].apply(extract_text_features)
@@ -144,7 +171,7 @@ def preprocess_data(raw_data):
             "user_id": df_balanced["reviewerID"].values
         }
         logger.info(
-            f"{platform}平台预处理完成：特征维度{len(selected_feats)}，样本量{len(df_balanced)}，正样本{sum(processed_data[platform]['target'])}")
+            f"{platform}平台预处理完成：特征维度{len(selected_feats)}，样本量{len(df_balanced)}，正样本{sum(processed_data[platform]['target'])}，正样本比例={sum(processed_data[platform]['target'])/len(processed_data[platform]['target']):.2%}")
 
     return processed_data
 
