@@ -2,6 +2,7 @@ import logging
 import random
 import numpy as np
 import torch
+import torch.nn.functional as F
 import matplotlib.pyplot as plt
 import seaborn as sns
 import os

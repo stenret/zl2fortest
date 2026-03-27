@@ -76,8 +76,9 @@ def load_amazon_data():
         # 采样
         if config.DATA_SAMPLE_RATIO < 1.0 and len(df) > 0:
             original_size = len(df)
-            df = df.sample(frac=config.DATA_SAMPLE_RATIO, random_state=config.SEED).reset_index(drop=True)
-            logger.info(f"{platform}平台数据采样：{original_size}条 → {len(df)}条（采样比例{config.DATA_SAMPLE_RATIO}）")
+            sample_ratio=cfg.get("sample")
+            df = df.sample(frac=(config.DATA_SAMPLE_RATIO*sample_ratio), random_state=config.SEED).reset_index(drop=True)
+            logger.info(f"{platform}平台数据采样：{original_size}条 → {len(df)}条（采样比例{config.DATA_SAMPLE_RATIO*sample_ratio}）")
 
         if len(df) == 0:
             logger.error(f"{platform}平台无有效数据，跳过")

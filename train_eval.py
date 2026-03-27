@@ -1,5 +1,8 @@
+import random
+
 import torch
 import torch.optim as optim
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 import numpy as np
 import os
@@ -223,7 +226,164 @@ def evaluate_model(model, dataloader, platform, device, model_name="CustomModel"
         return metrics, None
 
 
-# 消融实验（保留原逻辑）
+# ========== 新增：跨平台训练函数（支持 MMD 对齐） ==========
+def train_platform_model_with_mmd(model, dataloaders, target_platform, device,
+                                   use_decoder=True, use_mmd=True):
+    """
+    跨平台训练：使用其他平台的特征作为 MMD 对齐目标
+    :param model: 模型
+    :param dataloaders: 所有平台的数据加载器字典
+    :param target_platform: 当前训练的目标平台
+    :param device: 设备
+    :param use_decoder: 是否使用重构损失
+    :param use_mmd: 是否使用 MMD 损失
+    :return: 训练后的模型
+    """
+    optimizer = optim.Adam(model.parameters(), lr=config.LEARNING_RATE)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", patience=5, factor=0.5)
+    best_val_loss = float("inf")
+    early_stop_count = 0
+    loss_history = {"train": [], "val": []}
+    start_time = time.time()
+
+    # 获取源平台特征（用于 MMD 对齐）
+    source_platforms = [p for p in config.PLATFORM_CONFIG.keys() if p != target_platform and p in dataloaders]
+
+    for epoch in range(config.EPOCHS):
+        # 训练阶段
+        model.train()
+        train_loss = 0.0
+
+        for X_batch, y_batch in dataloaders[target_platform]["train"]:
+            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+            optimizer.zero_grad()
+
+            # 从源平台随机采样一个批次的特征
+            cross_platform_feat = None
+            if use_mmd and source_platforms:
+                source_platform = random.choice(source_platforms)
+                source_loader = dataloaders[source_platform]["train"]
+                # 取一个 batch 作为跨平台特征
+                source_batch = next(iter(source_loader))
+                cross_platform_feat = source_batch[0].to(device)
+
+            # 计算损失
+            global_feat, recon_feat, pred = model.forward(target_platform, X_batch)
+
+            # 1. 重构损失（可选）
+            if use_decoder:
+                recon_loss = model.reconstruction_loss(recon_feat, X_batch)
+            else:
+                recon_loss = torch.tensor(0.0).to(device)
+
+            # 2. 下游任务损失
+            task_loss = F.binary_cross_entropy(pred.squeeze(), y_batch.float())
+
+            # 3. MMD 损失（可选）
+            if use_mmd and cross_platform_feat is not None:
+                mmd_kernel = model.mmd_loss(global_feat, cross_platform_feat)
+                mmd_loss = mmd_kernel.mean()
+            else:
+                mmd_loss = torch.tensor(0.0).to(device)
+
+            # 总损失
+            total_loss = (
+                config.RECONSTRUCTION_LOSS_WEIGHT * recon_loss
+                + config.MMD_LOSS_WEIGHT * mmd_loss
+                + task_loss
+            )
+
+            total_loss.backward()
+            optimizer.step()
+            train_loss += total_loss.item() * X_batch.size(0)
+
+        avg_train_loss = train_loss / len(dataloaders[target_platform]["train"].dataset)
+        loss_history["train"].append(avg_train_loss)
+
+        # 验证阶段
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for X_batch, y_batch in dataloaders[target_platform]["val"]:
+                X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+
+                global_feat, recon_feat, pred = model.forward(target_platform, X_batch)
+
+                if use_decoder:
+                    recon_loss = model.reconstruction_loss(recon_feat, X_batch)
+                else:
+                    recon_loss = torch.tensor(0.0).to(device)
+
+                task_loss = F.binary_cross_entropy(pred.squeeze(), y_batch.float())
+
+                if use_mmd and source_platforms:
+                    source_platform = random.choice(source_platforms)
+                    source_batch = next(iter(dataloaders[source_platform]["val"]))
+                    cross_platform_feat = source_batch[0].to(device)
+                    mmd_kernel = model.mmd_loss(global_feat, cross_platform_feat)
+                    mmd_loss = mmd_kernel.mean()
+                else:
+                    mmd_loss = torch.tensor(0.0).to(device)
+
+                val_loss_item = (
+                    config.RECONSTRUCTION_LOSS_WEIGHT * recon_loss
+                    + config.MMD_LOSS_WEIGHT * mmd_loss
+                    + task_loss
+                )
+                val_loss += val_loss_item.item() * X_batch.size(0)
+
+        avg_val_loss = val_loss / len(dataloaders[target_platform]["val"].dataset)
+        loss_history["val"].append(avg_val_loss)
+
+        # 学习率调整
+        scheduler.step(avg_val_loss)
+
+        # 早停
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            early_stop_count = 0
+            model_suffix = f"{target_platform}_best_model.pth"
+            if not use_decoder:
+                model_suffix = f"{target_platform}_no_decoder_best_model.pth"
+            elif not use_mmd:
+                model_suffix = f"{target_platform}_no_mmd_best_model.pth"
+            torch.save(model.state_dict(), os.path.join(config.MODEL_DIR, model_suffix))
+        else:
+            early_stop_count += 1
+            if early_stop_count >= config.PATIENCE:
+                logger.info(f"Early stopping at epoch {epoch + 1} for {target_platform}!")
+                break
+
+        logger.info(
+            f"Platform: {target_platform}, Epoch: {epoch + 1}, Train Loss: {avg_train_loss:.6f}, Val Loss: {avg_val_loss:.6f}")
+
+    # 统计训练指标
+    end_time = time.time()
+    train_metrics = get_training_metrics(start_time, end_time, model)
+
+    # 可视化损失曲线
+    title_suffix = ""
+    if not use_decoder:
+        title_suffix = "(Without Decoder)"
+    elif not use_mmd:
+        title_suffix = "(Without MMD)"
+
+    plot_loss_curve(loss_history,
+                   os.path.join(config.RESULT_DIR, f"{target_platform}{title_suffix}_loss_curve.png"),
+                   title_suffix=title_suffix)
+
+    # 加载最佳模型
+    model_suffix = f"{target_platform}_best_model.pth"
+    if not use_decoder:
+        model_suffix = f"{target_platform}_no_decoder_best_model.pth"
+    elif not use_mmd:
+        model_suffix = f"{target_platform}_no_mmd_best_model.pth"
+
+    model.load_state_dict(torch.load(os.path.join(config.MODEL_DIR, model_suffix)))
+    return model, train_metrics
+
+
+# 消融实验（修复版）
 def ablation_experiment(split_data, device):
     ablation_configs = {
         "Full Model": {"remove_decoder": False, "remove_mmd": False},
@@ -236,14 +396,44 @@ def ablation_experiment(split_data, device):
     platform_feat_dims = {p: cfg["feat_dim"] for p, cfg in config.PLATFORM_CONFIG.items()}
 
     for exp_name, cfg in ablation_configs.items():
+        logger.info(f"\n{'='*60}")
         logger.info(f"Running ablation experiment: {exp_name}")
+        logger.info(f"{'='*60}")
+
+        remove_decoder = cfg.get("remove_decoder", False)
+        remove_mmd = cfg.get("remove_mmd", False)
+        remove_task = cfg.get("remove_task", False)
+
         for platform in config.PLATFORM_CONFIG.keys():
             if platform not in dataloaders:
                 continue
+
             # 初始化模型
             model = FeatureDistillationModel(platform_feat_dims).to(device)
-            # 训练模型
-            model, _ = train_platform_model(model, dataloaders[platform], platform, device)
+
+            # 根据消融配置选择训练策略
+            if remove_task:
+                # Without Downstream Task: 仅优化重构+MMD
+                logger.info(f"Training {platform} without downstream task...")
+                # 需要特殊处理：不计算 task_loss
+                model, _ = train_without_task(
+                    model, dataloaders, platform, device,
+                    use_decoder=not remove_decoder,
+                    use_mmd=not remove_mmd
+                )
+            elif remove_decoder or remove_mmd:
+                # Without Decoder 或 Without MMD: 单平台训练
+                logger.info(f"Training {platform} without decoder/MMD (single-platform)...")
+                model, _ = train_platform_model(model, dataloaders[platform], platform, device)
+            else:
+                # Full Model: 跨平台训练（真正使用 MMD）
+                logger.info(f"Training {platform} with full cross-platform alignment...")
+                model, _ = train_platform_model_with_mmd(
+                    model, dataloaders, platform, device,
+                    use_decoder=True,
+                    use_mmd=True
+                )
+
             # 评估模型
             metrics, _ = evaluate_model(model, dataloaders[platform], platform, device)
             ablation_results.append({
@@ -252,11 +442,122 @@ def ablation_experiment(split_data, device):
                 "AUC": metrics["AUC"],
                 "F1-score": metrics["F1-score"]
             })
+            logger.info(f"{exp_name} - {platform}: AUC={metrics['AUC']:.4f}, F1={metrics['F1-score']:.4f}")
 
     # 保存消融实验结果
     save_results(ablation_results, os.path.join(config.RESULT_DIR, "ablation_experiment_results.csv"))
-    logger.info("Ablation experiment completed!")
+    logger.info("\nAblation experiment completed!")
     return ablation_results
+
+
+# 新增：无下游任务的训练函数
+def train_without_task(model, dataloaders, target_platform, device, use_decoder=True, use_mmd=True):
+    """
+    仅用于消融实验：Without Downstream Task
+    不计算分类损失，只优化重构和 MMD
+    """
+    optimizer = optim.Adam(model.parameters(), lr=config.LEARNING_RATE)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", patience=5, factor=0.5)
+    best_val_loss = float("inf")
+    early_stop_count = 0
+    loss_history = {"train": [], "val": []}
+    start_time = time.time()
+
+    source_platforms = [p for p in config.PLATFORM_CONFIG.keys() if p != target_platform and p in dataloaders]
+
+    for epoch in range(config.EPOCHS):
+        model.train()
+        train_loss = 0.0
+
+        for X_batch, y_batch in dataloaders[target_platform]["train"]:
+            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+            optimizer.zero_grad()
+
+            global_feat, recon_feat, _ = model.forward(target_platform, X_batch)
+
+            # 1. 重构损失
+            if use_decoder:
+                recon_loss = model.reconstruction_loss(recon_feat, X_batch)
+            else:
+                recon_loss = torch.tensor(0.0).to(device)
+
+            # 2. MMD 损失
+            cross_platform_feat = None
+            if use_mmd and source_platforms:
+                source_platform = random.choice(source_platforms)
+                source_loader = dataloaders[source_platform]["train"]
+                source_batch = next(iter(source_loader))
+                cross_platform_feat = source_batch[0].to(device)
+                mmd_kernel = model.mmd_loss(global_feat, cross_platform_feat)
+                mmd_loss = mmd_kernel.mean()
+            else:
+                mmd_loss = torch.tensor(0.0).to(device)
+
+            # 总损失（不含 task_loss）
+            total_loss = (
+                config.RECONSTRUCTION_LOSS_WEIGHT * recon_loss
+                + config.MMD_LOSS_WEIGHT * mmd_loss
+            )
+
+            total_loss.backward()
+            optimizer.step()
+            train_loss += total_loss.item() * X_batch.size(0)
+
+        avg_train_loss = train_loss / len(dataloaders[target_platform]["train"].dataset)
+        loss_history["train"].append(avg_train_loss)
+
+        # 验证
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for X_batch, y_batch in dataloaders[target_platform]["val"]:
+                X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+
+                global_feat, recon_feat, _ = model.forward(target_platform, X_batch)
+
+                if use_decoder:
+                    recon_loss = model.reconstruction_loss(recon_feat, X_batch)
+                else:
+                    recon_loss = torch.tensor(0.0).to(device)
+
+                if use_mmd and source_platforms:
+                    source_platform = random.choice(source_platforms)
+                    source_batch = next(iter(dataloaders[source_platform]["val"]))
+                    cross_platform_feat = source_batch[0].to(device)
+                    mmd_kernel = model.mmd_loss(global_feat, cross_platform_feat)
+                    mmd_loss = mmd_kernel.mean()
+                else:
+                    mmd_loss = torch.tensor(0.0).to(device)
+
+                val_loss_item = (
+                    config.RECONSTRUCTION_LOSS_WEIGHT * recon_loss
+                    + config.MMD_LOSS_WEIGHT * mmd_loss
+                )
+                val_loss += val_loss_item.item() * X_batch.size(0)
+
+        avg_val_loss = val_loss / len(dataloaders[target_platform]["val"].dataset)
+        loss_history["val"].append(avg_val_loss)
+
+        scheduler.step(avg_val_loss)
+
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            early_stop_count = 0
+            torch.save(model.state_dict(), os.path.join(config.MODEL_DIR, f"{target_platform}_no_task_best_model.pth"))
+        else:
+            early_stop_count += 1
+            if early_stop_count >= config.PATIENCE:
+                logger.info(f"Early stopping at epoch {epoch + 1} for {target_platform} (No Task)!")
+                break
+
+        logger.info(
+            f"No Task - Platform: {target_platform}, Epoch: {epoch + 1}, Train Loss: {avg_train_loss:.6f}, Val Loss: {avg_val_loss:.6f}")
+
+    end_time = time.time()
+    train_metrics = get_training_metrics(start_time, end_time, model)
+    plot_loss_curve(loss_history, os.path.join(config.RESULT_DIR, f"{target_platform}_no_task_loss_curve.png"))
+    model.load_state_dict(torch.load(os.path.join(config.MODEL_DIR, f"{target_platform}_no_task_best_model.pth")))
+    return model, train_metrics
 
 
 # 超参数敏感性分析（保留原逻辑）
@@ -446,8 +747,9 @@ def main_train_eval(split_data):
     # ========== 4. 超参数敏感性分析 ==========
     hyperparam_sensitivity_analysis(split_data, device)
 
-    # ========== 5. Baseline对比实验（核心新增） ==========
+    # ========== 5. Baseline 对比实验（核心新增） ==========
     run_baseline_experiments(split_data, device)
 
     logger.info("\n=== 所有实验完成！结果已保存至 ./results 目录 ===")
     return statistical_results, mmd_matrix if len(platforms) >= 2 else None
+
