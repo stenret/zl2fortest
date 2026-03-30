@@ -26,10 +26,14 @@ def main():
     logger.info("Final Statistical Results (Mean±Std)")
     logger.info("=" * 60)
     for res in statistical_results:
-        logger.info(f"\nPlatform: {res['platform']}")
-        logger.info(f"  - AUC: {res['AUC_formatted']}")
-        logger.info(f"  - F1-score: {res['F1_formatted']}")
+        logger.info(f"\nPlatform: {res['platform']} ({res['target_type']})")
         logger.info(f"  - Model Params: {res['total_params_million']}M")
+        
+        # 动态输出所有指标的均值±标准差
+        for key, value in res.items():
+            if key.endswith("_formatted") and key not in ["target_type_formatted"]:
+                metric_name = key.replace("_formatted", "")
+                logger.info(f"  - {metric_name}: {value}")
 
     if mmd_matrix is not None:
         logger.info(f"\nMMD Matrix:\n{mmd_matrix}")

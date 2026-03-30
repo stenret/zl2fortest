@@ -39,16 +39,64 @@ def set_seed(seed=42):
     torch.backends.cudnn.benchmark = False
 
 
-# 计算评估指标
-def calculate_metrics(y_true, y_pred_prob):
-    if len(np.unique(y_pred_prob)) == 1:
-        auc = 0.5
-        f1 = 0.0
-    else:
-        auc = roc_auc_score(y_true, y_pred_prob)
-        y_pred = (y_pred_prob >= 0.5).astype(int)
-        f1 = f1_score(y_true, y_pred)
-    return {"AUC": auc, "F1-score": f1}
+# 计算评估指标（支持多任务类型）
+def calculate_metrics(y_true, y_pred_prob, task_type="classification"):
+    """
+    根据不同任务类型计算评估指标
+    :param y_true: 真实标签
+    :param y_pred_prob: 预测概率
+    :param task_type: 任务类型 (classification/regression/ranking)
+    :return: 指标字典
+    """
+    metrics = {}
+    
+    if task_type == "classification":
+        # 分类任务：AUC + F1
+        if len(np.unique(y_pred_prob)) == 1:
+            auc = 0.5
+            f1 = 0.0
+        else:
+            auc = roc_auc_score(y_true, y_pred_prob)
+            y_pred = (y_pred_prob >= 0.5).astype(int)
+            f1 = f1_score(y_true, y_pred, zero_division=0)
+        metrics = {"AUC": auc, "F1-score": f1}
+        
+    elif task_type == "regression":
+        # 回归任务：预测具体评分（1-5 分）
+        from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+        # 将概率映射回 1-5 分范围
+        y_pred_rating = np.clip(y_pred_prob * 4 + 1, 1, 5)
+        mse = mean_squared_error(y_true, y_pred_rating)
+        mae = mean_absolute_error(y_true, y_pred_rating)
+        r2 = r2_score(y_true, y_pred_rating)
+        metrics = {"MSE": round(mse, 4), "MAE": round(mae, 4), "R2": round(r2, 4)}
+    
+    elif task_type == "ranking":
+        # 排序任务：NDCG 指标
+        try:
+            from sklearn.metrics import ndcg_score
+            # 需要至少 2 个样本
+            if len(y_true) >= 2:
+                # 修复 1：使用原始二值标签而不是重新阈值化
+                y_true_rel = y_true.astype(int).reshape(1, -1)
+                y_pred_rank = y_pred_prob.reshape(1, -1)
+                
+                # 修复 2：检查是否有正样本
+                if np.sum(y_true_rel) > 0:
+                    ndcg = ndcg_score(y_true_rel, y_pred_rank, k=min(10, len(y_true)))
+                    metrics = {"NDCG": round(ndcg, 4)}
+                else:
+                    # 没有正样本，NDCG 无意义
+                    print(f"警告：Ranking 任务中没有正样本，NDCG=0.0")
+                    metrics = {"NDCG": 0.0}
+            else:
+                metrics = {"NDCG": 0.0}
+        except Exception as e:
+            # 修复：使用 print 代替 logger（因为此函数内无法访问 logger）
+            print(f"警告：NDCG 计算失败：{e}")
+            metrics = {"NDCG": 0.0}
+    
+    return metrics
 
 
 # 可视化损失曲线
@@ -76,7 +124,7 @@ def plot_mmd_heatmap(mmd_matrix, platforms, save_path):
     plt.savefig(save_path, dpi=300, bbox_inches="tight")
     plt.close()
 
-# 生成超参数 α 性能曲线（论文专用）
+# 生成超参数 α 性能曲线（论文专用，修复多指标兼容）
 def plot_alpha_curve(hyper_results, save_path):
     import pandas as pd
     df = pd.DataFrame(hyper_results)
@@ -85,19 +133,39 @@ def plot_alpha_curve(hyper_results, save_path):
     platforms = df["platform"].unique()
 
     plt.style.use('default')
-    plt.figure(figsize=(7, 4))
-
-    for platform in platforms:
-        sub = df[df["platform"] == platform]
-        sub = sub.sort_values("alpha")
-        auc = sub["AUC"].values
-        plt.plot(sub["alpha"], auc, marker="o", linewidth=2, label=platform)
-
-    plt.xlabel("α (Reconstruction Loss Weight)", fontsize=11)
-    plt.ylabel("AUC", fontsize=11)
-    plt.title("Hyperparameter Sensitivity (α vs AUC)", fontsize=12)
-    plt.legend()
-    plt.grid(alpha=0.3)
+    
+    # 检测有哪些指标列
+    metric_cols = [col for col in df.columns if col not in ["alpha", "platform", "target_type"]]
+    
+    # 如果没有找到指标，使用默认的 AUC
+    if not metric_cols:
+        metric_cols = ["AUC"]
+    
+    # 选择第一个主要指标（优先级：AUC > NDCG > 其他）
+    primary_metric = "AUC" if "AUC" in metric_cols else metric_cols[0]
+    
+    # 创建子图（每个平台一个子图）
+    n_platforms = len(platforms)
+    fig, axes = plt.subplots(1, n_platforms, figsize=(5 * n_platforms, 4))
+    
+    if n_platforms == 1:
+        axes = [axes]
+    
+    for idx, platform in enumerate(platforms):
+        ax = axes[idx]
+        sub = df[df["platform"] == platform].sort_values("alpha")
+        
+        if primary_metric in sub.columns:
+            metric_values = sub[primary_metric].values
+            ax.plot(sub["alpha"], metric_values, marker="o", linewidth=2, label=platform)
+            ax.set_xlabel("α (Reconstruction Loss Weight)", fontsize=11)
+            ax.set_ylabel(primary_metric, fontsize=11)
+            ax.set_title(f"{platform}: α vs {primary_metric}", fontsize=12)
+            ax.legend()
+            ax.grid(alpha=0.3)
+        else:
+            ax.text(0.5, 0.5, f"No {primary_metric} data", ha='center', va='center')
+    
     plt.tight_layout()
     plt.savefig(save_path, dpi=300)
     plt.close()

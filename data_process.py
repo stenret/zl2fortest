@@ -111,25 +111,32 @@ def preprocess_data(raw_data):
             df["target"] = ((df["reviewText"].str.len() > 200) & (df["overall"] >= 4.0)).astype(int)
             logger.info(f"{platform}平台使用 CTR 目标：长评论 (>200) 且高分 (≥4) → 正样本")
             
-        elif target_type == "CVR":
+        elif target_type == "CVR" or target_type == "CVR_Classification":
             # Electronics 平台：CVR - 模拟转化行为
             # 策略：仅 5 星评为正样本（严格转化标准）
             df["target"] = (df["overall"] >= 5.0).astype(int)
             logger.info(f"{platform}平台使用 CVR 目标：仅 5 星评→正样本（严格转化）")
-            
+
         elif target_type == "Interaction":
             # Clothing 平台：Interaction - 模拟交互行为
             # 策略：helpful 投票数>0 或评分>=4 为正样本
             df["helpful_votes"] = df["helpful"].apply(lambda x: x[0] if isinstance(x, list) and len(x) > 0 else 0)
             df["target"] = ((df["helpful_votes"] > 0) | (df["overall"] >= 4.0)).astype(int)
+            
+            # ========== 新增：调试信息 ==========
+            pos_count = ((df["helpful_votes"] > 0).sum(), (df["overall"] >= 4.0).sum())
+            total_pos = df["target"].sum()
             logger.info(f"{platform}平台使用 Interaction 目标：有帮助投票或高分 (≥4) → 正样本")
+            logger.info(f"  - Helpful 投票>0 的样本数：{pos_count[0]}")
+            logger.info(f"  - 评分≥4 的样本数：{pos_count[1]}")
+            logger.info(f"  - 总正样本数：{total_pos}, 正样本比例：{total_pos/len(df):.2%}")
             
         else:
             # 默认策略：使用原始评分阈值
             df = df[df["overall"].isin([1.0, 2.0, 4.0, 5.0])].reset_index(drop=True)
             df["target"] = (df["overall"] >= 4.0).astype(int)
             logger.info(f"{platform}平台使用默认目标：评分≥4→正样本")
-        
+
         # 过滤无效目标
         if len(df) == 0:
             logger.warning(f"{platform}平台无有效正负样本，跳过")
@@ -170,6 +177,13 @@ def preprocess_data(raw_data):
             "target": df_balanced["target"].values,
             "user_id": df_balanced["reviewerID"].values
         }
+        
+        # 如果有额外目标类型，也保存
+        if "target_regression" in df_balanced.columns:
+            processed_data[platform]["target_regression"] = df_balanced["target_regression"].values
+        if "target_ranking" in df_balanced.columns:
+            processed_data[platform]["target_ranking"] = df_balanced["target_ranking"].values
+        
         logger.info(
             f"{platform}平台预处理完成：特征维度{len(selected_feats)}，样本量{len(df_balanced)}，正样本{sum(processed_data[platform]['target'])}，正样本比例={sum(processed_data[platform]['target'])/len(processed_data[platform]['target']):.2%}")
 

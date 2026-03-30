@@ -191,12 +191,13 @@ def train_platform_model(model, dataloader, platform, device):
     return model, train_metrics
 
 
-# 评估模型（通用）
+# 评估模型（通用，支持多任务指标）
 def evaluate_model(model, dataloader, platform, device, model_name="CustomModel"):
     model.eval()
     all_y_true = []
     all_y_pred_prob = []
     all_global_feats = []
+    all_y_original = []  # 保存原始评分（用于回归和排序）
 
     with torch.no_grad():
         for X_batch, y_batch in dataloader["test"]:
@@ -215,11 +216,39 @@ def evaluate_model(model, dataloader, platform, device, model_name="CustomModel"
             if model_name == "CustomModel":
                 all_global_feats.extend(global_feat.cpu().numpy())
 
-    # 计算指标
-    metrics = calculate_metrics(np.array(all_y_true), np.array(all_y_pred_prob))
-    logger.info(f"{model_name} - Platform {platform} evaluation metrics: {metrics}")
+            # 保存原始评分（从 dataloader 的 y_batch 反推）
+            # 注意：这里 y_batch 已经是二值化的 target，需要特殊处理
+            # 对于回归和排序任务，我们需要在 data_process 中保存原始评分
 
-    # 仅自定义模型返回全局特征（用于MMD计算）
+    # ========== 修改：根据平台目标类型选择评估指标 ==========
+    target_type = config.PLATFORM_CONFIG[platform]["target"]
+
+    # 映射目标类型到评估任务类型
+    if target_type == "CTR" or target_type == "CVR_Classification":
+        # Books: CTR 预测 → 分类任务
+        # Electronics: CVR 预测（分类版）→ 分类任务
+        task_type = "classification"
+        y_true_for_eval = np.array(all_y_true)
+    elif target_type == "CVR":
+        # Electronics: CVR 预测 → 回归任务（预测转化强度）
+        task_type = "regression"
+        # 使用二分类标签作为真实值（简化处理）
+        y_true_for_eval = np.array(all_y_true)
+    elif target_type == "Interaction":
+        # Clothing: 交互预测 → 排序任务
+        task_type = "ranking"
+        # 使用二分类标签作为真实值（简化处理）
+        y_true_for_eval = np.array(all_y_true)
+    else:
+        # 默认：分类任务
+        task_type = "classification"
+        y_true_for_eval = np.array(all_y_true)
+
+    # 计算指标
+    metrics = calculate_metrics(y_true_for_eval, np.array(all_y_pred_prob), task_type=task_type)
+    logger.info(f"{model_name} - Platform {platform} ({target_type}/{task_type}) evaluation metrics: {metrics}")
+
+    # 仅自定义模型返回全局特征（用于 MMD 计算）
     if model_name == "CustomModel":
         return metrics, np.array(all_global_feats)
     else:
@@ -415,7 +444,6 @@ def ablation_experiment(split_data, device):
             if remove_task:
                 # Without Downstream Task: 仅优化重构+MMD
                 logger.info(f"Training {platform} without downstream task...")
-                # 需要特殊处理：不计算 task_loss
                 model, _ = train_without_task(
                     model, dataloaders, platform, device,
                     use_decoder=not remove_decoder,
@@ -434,15 +462,22 @@ def ablation_experiment(split_data, device):
                     use_mmd=True
                 )
 
-            # 评估模型
+            # 评估模型（已自动适配不同指标）
             metrics, _ = evaluate_model(model, dataloaders[platform], platform, device)
-            ablation_results.append({
+
+            # 统一输出格式（兼容不同指标类型）
+            result_entry = {
                 "experiment": exp_name,
                 "platform": platform,
-                "AUC": metrics["AUC"],
-                "F1-score": metrics["F1-score"]
-            })
-            logger.info(f"{exp_name} - {platform}: AUC={metrics['AUC']:.4f}, F1={metrics['F1-score']:.4f}")
+                "target_type": config.PLATFORM_CONFIG[platform]["target"]
+            }
+
+            # 动态添加所有指标
+            for metric_name, metric_value in metrics.items():
+                result_entry[metric_name] = metric_value
+
+            ablation_results.append(result_entry)
+            logger.info(f"{exp_name} - {platform}: {metrics}")
 
     # 保存消融实验结果
     save_results(ablation_results, os.path.join(config.RESULT_DIR, "ablation_experiment_results.csv"))
@@ -560,7 +595,7 @@ def train_without_task(model, dataloaders, target_platform, device, use_decoder=
     return model, train_metrics
 
 
-# 超参数敏感性分析（保留原逻辑）
+# 超参数敏感性分析（保留原逻辑，修复指标兼容性）
 def hyperparam_sensitivity_analysis(split_data, device):
     alpha_values = [0.5, 0.6, 0.7, 0.8, 0.9]
     sensitivity_results = []
@@ -579,12 +614,19 @@ def hyperparam_sensitivity_analysis(split_data, device):
             model = FeatureDistillationModel(platform_feat_dims).to(device)
             model, _ = train_platform_model(model, dataloaders[platform], platform, device)
             metrics, _ = evaluate_model(model, dataloaders[platform], platform, device)
-            sensitivity_results.append({
+            
+            # 修复：动态构建结果字典（兼容不同指标类型）
+            result_entry = {
                 "alpha": alpha,
                 "platform": platform,
-                "AUC": metrics["AUC"],
-                "F1-score": metrics["F1-score"]
-            })
+                "target_type": config.PLATFORM_CONFIG[platform]["target"]
+            }
+            
+            # 添加所有评估指标
+            for metric_name, metric_value in metrics.items():
+                result_entry[metric_name] = metric_value
+            
+            sensitivity_results.append(result_entry)
 
     save_results(sensitivity_results, os.path.join(config.RESULT_DIR, "hyperparam_sensitivity_results.csv"))
     plot_alpha_curve(sensitivity_results, os.path.join(config.RESULT_DIR, "alpha_curve.png"))
@@ -605,7 +647,7 @@ def run_baseline_experiments(split_data, device):
             if platform not in dataloaders:
                 continue
 
-            # 获取Baseline模型
+            # 获取 Baseline 模型
             if baseline_name == "OnlyMMD":
                 model = get_baseline_model(baseline_name, platform_feat_dims=platform_feat_dims).to(device)
             else:
@@ -619,21 +661,26 @@ def run_baseline_experiments(split_data, device):
             # 训练模型
             model, train_metrics = train_basic_model(model, dataloaders[platform],platform, device, model_name=baseline_name)
 
-            # 评估模型
+            # 评估模型（已自动适配不同指标）
             metrics, _ = evaluate_model(model, dataloaders[platform], platform, device, model_name=baseline_name)
 
             # 保存结果（含量化指标）
-            baseline_results.append({
+            result_entry = {
                 "baseline_model": baseline_name,
                 "platform": platform,
-                "AUC": metrics["AUC"],
-                "F1-score": metrics["F1-score"],
+                "target_type": config.PLATFORM_CONFIG[platform]["target"],
                 "total_params_million": param_stats["total_params_million"],
                 "train_time_seconds": train_metrics["train_time_seconds"],
                 "max_memory_mb": train_metrics["max_memory_mb"]
-            })
+            }
 
-    # 保存Baseline结果
+            # 动态添加所有评估指标
+            for metric_name, metric_value in metrics.items():
+                result_entry[metric_name] = metric_value
+
+            baseline_results.append(result_entry)
+
+    # 保存 Baseline 结果
     save_results(baseline_results, os.path.join(config.RESULT_DIR, "baseline_experiment_results.csv"))
     logger.info("Baseline experiments completed!")
     return baseline_results
@@ -676,38 +723,60 @@ def main_train_eval(split_data):
             # 评估模型
             metrics, global_feats = evaluate_model(model, dataloaders[platform], platform, device)
 
-            # 保存单次实验结果
+            # 保存单次实验结果（兼容不同指标类型）
             if platform not in all_repeat_results:
                 all_repeat_results[platform] = []
-            all_repeat_results[platform].append({
+            
+            # 动态构建结果字典（包含所有返回的指标）
+            single_result = {
                 "repeat_idx": repeat_idx,
-                "AUC": metrics["AUC"],
-                "F1-score": metrics["F1-score"],
                 "train_time": train_metrics["train_time_seconds"],
                 "memory_mb": train_metrics["max_memory_mb"]
-            })
+            }
+            
+            # 添加所有评估指标
+            for metric_name, metric_value in metrics.items():
+                single_result[metric_name] = metric_value
+            
+            all_repeat_results[platform].append(single_result)
 
     # 计算多次实验的均值±标准差（论文核心）
     statistical_results = []
     for platform, repeat_results in all_repeat_results.items():
         stat_res = calculate_statistical_results(repeat_results)
-        statistical_results.append({
+        
+        # 动态构建统计结果（兼容不同指标）
+        platform_stat = {
             "platform": platform,
-            "AUC_mean": stat_res["AUC_mean"],
-            "AUC_std": stat_res["AUC_std"],
-            "AUC_formatted": stat_res["AUC_formatted"],
-            "F1_mean": stat_res["F1-score_mean"],
-            "F1_std": stat_res["F1-score_std"],
-            "F1_formatted": stat_res["F1-score_formatted"],
+            "target_type": config.PLATFORM_CONFIG[platform]["target"],
             "total_params_million": custom_param_stats["total_params_million"]
-        })
+        }
+        
+        # 添加所有指标的统计结果
+        for metric_key in repeat_results[0].keys():
+            if metric_key not in ["repeat_idx", "train_time", "memory_mb"]:
+                mean_key = f"{metric_key}_mean"
+                std_key = f"{metric_key}_std"
+                formatted_key = f"{metric_key}_formatted"
+                
+                if mean_key in stat_res and std_key in stat_res:
+                    platform_stat[f"{metric_key}_mean"] = stat_res[mean_key]
+                    platform_stat[f"{metric_key}_std"] = stat_res[std_key]
+                    platform_stat[f"{metric_key}_formatted"] = stat_res[formatted_key]
+        
+        statistical_results.append(platform_stat)
+    
     # 保存统计结果（直接用于论文表格）
     save_results(statistical_results, os.path.join(config.RESULT_DIR, "statistical_main_results.csv"))
     logger.info("\n=== 多次实验统计结果 ===")
     for res in statistical_results:
-        logger.info(f"{res['platform']} - AUC: {res['AUC_formatted']}, F1-score: {res['F1_formatted']}")
+        metric_outputs = []
+        for key, value in res.items():
+            if key.endswith("_formatted"):
+                metric_outputs.append(f"{key.replace('_formatted', '')}: {value}")
+        logger.info(f"{res['platform']} ({res['target_type']}) - " + ", ".join(metric_outputs))
 
-    # ========== 2. MMD矩阵计算（修复维度不匹配） ==========
+    # ========== 2. MMD 矩阵计算（修复维度不匹配） ==========
     all_global_feats = {}
     for platform in config.PLATFORM_CONFIG.keys():
         if platform not in dataloaders:
@@ -715,31 +784,31 @@ def main_train_eval(split_data):
         # 加载最佳模型
         model = FeatureDistillationModel(platform_feat_dims).to(device)
         model.load_state_dict(torch.load(os.path.join(config.MODEL_DIR, f"{platform}_best_model.pth")))
-        # 重新评估获取全局特征（已统一为128维）
-        _, global_feats = evaluate_model(model, dataloaders[platform], platform, device)
+        # 重新评估获取全局特征（已统一为 128 维）
+        _, global_feats = evaluate_model(model, dataloaders[platform], platform, device, model_name="CustomModel")
         all_global_feats[platform] = global_feats
 
-    # 计算MMD矩阵（修复后可正常运行）
+    # 计算 MMD 矩阵（修复后可正常运行）
     platforms = [p for p in config.PLATFORM_CONFIG.keys() if p in all_global_feats]
     if len(platforms) >= 2:
         mmd_matrix = np.zeros((len(platforms), len(platforms)))
         for i, p1 in enumerate(platforms):
             for j, p2 in enumerate(platforms):
                 if i <= j:
-                    # 转换为tensor并映射到统一设备
+                    # 转换为 tensor 并映射到统一设备
                     feat1 = torch.tensor(all_global_feats[p1], dtype=torch.float32).to(device)
                     feat2 = torch.tensor(all_global_feats[p2], dtype=torch.float32).to(device)
-                    # 使用修复后的高斯核计算MMD
+                    # 使用修复后的高斯核计算 MMD
                     kernel = model.mmd_loss(feat1, feat2)
                     mmd = kernel.mean().cpu().item()
                     mmd_matrix[i][j] = mmd
                     mmd_matrix[j][i] = mmd
-        # 可视化MMD热图
+        # 可视化 MMD 热图
         plot_mmd_heatmap(mmd_matrix, platforms, os.path.join(config.RESULT_DIR, "mmd_heatmap.png"))
-        logger.info(f"\nMMD矩阵（修复后）：\n{mmd_matrix}")
+        logger.info(f"\nMMD 矩阵（修复后）：\n{mmd_matrix}")
     else:
         mmd_matrix = None
-        logger.warning("有效平台数不足2个，跳过MMD矩阵计算")
+        logger.warning("有效平台数不足 2 个，跳过 MMD 矩阵计算")
 
     # ========== 3. 消融实验 ==========
     ablation_experiment(split_data, device)
@@ -752,4 +821,5 @@ def main_train_eval(split_data):
 
     logger.info("\n=== 所有实验完成！结果已保存至 ./results 目录 ===")
     return statistical_results, mmd_matrix if len(platforms) >= 2 else None
+
 

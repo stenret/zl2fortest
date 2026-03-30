@@ -36,7 +36,7 @@ PLATFORM_CONFIG = {
     "Electronics": {
         "file_name": "Electronics_5.json.gz",
         "feat_dim": 7,
-        "target": "CVR",
+        "target": "CVR_Classification",  # 修改为分类版本
         "is_long_tail": False,
         "sample":1
     },
