@@ -91,7 +91,8 @@ def load_amazon_data():
 # 数据预处理
 def preprocess_data(raw_data):
     processed_data = {}
-    scaler = MinMaxScaler()
+    # 修改：为每个平台创建独立的 Standardizer
+    scalers = {}
 
     for platform, df in raw_data.items():
         # 基础过滤
@@ -151,10 +152,51 @@ def preprocess_data(raw_data):
         feat_dim = config.PLATFORM_CONFIG[platform]["feat_dim"]
         selected_feats = feat_cols[:feat_dim]
 
-        # 标准化
+        # ========== 修改 1：为每个平台单独标准化（分布异构关键） ==========
+        scaler = MinMaxScaler()
         df[selected_feats] = scaler.fit_transform(df[selected_feats])
+        scalers[platform] = scaler  # 保存该平台专用的 scaler
+        logger.info(f"{platform}平台特征标准化完成（独立 scaler，体现分布异构）")
 
-        # 正负样本均衡
+        # ========== 修改 2：长尾分布特殊处理（分布异构关键） ==========
+        is_long_tail = config.PLATFORM_CONFIG[platform].get("is_long_tail", False)
+        
+        if is_long_tail:
+            logger.info(f"{platform}平台检测到长尾分布，应用特殊处理策略...")
+            
+            # 策略 1：对稀有类别过采样（低评分样本通常较少）
+            rating_distribution = df["overall"].value_counts().sort_index()
+            logger.info(f"  - 原始评分分布：\n{rating_distribution}")
+            
+            # 计算各评分等级的采样比例（反向加权：稀有类别更高比例）
+            min_count = rating_distribution.min()
+            max_count = rating_distribution.max()
+            
+            # 分层采样：低评分多保留，高评分少保留
+            sampled_dfs = []
+            for rating in sorted(df["overall"].unique()):
+                rating_df = df[df["overall"] == rating]
+                count = len(rating_df)
+                
+                # 计算采样比例：评分越低，保留比例越高
+                if count > 0:
+                    # 长尾分布：稀有类别（低分）保留更多
+                    if rating <= 2.0:
+                        sample_frac = min(1.0, 0.8)  # 低分保留 80%
+                    elif rating <= 3.0:
+                        sample_frac = min(1.0, 0.6)  # 中低分保留 60%
+                    else:
+                        sample_frac = min(1.0, 0.4)  # 高分保留 40%
+                    
+                    sampled = rating_df.sample(frac=sample_frac, random_state=config.SEED)
+                    sampled_dfs.append(sampled)
+                    logger.info(f"  - 评分{rating}: {count}条 → 采样{len(sampled)}条 (比例{sample_frac:.1%})")
+            
+            # 合并采样后的数据
+            df = pd.concat(sampled_dfs).sample(frac=1, random_state=config.SEED).reset_index(drop=True)
+            logger.info(f"{platform}平台长尾分布处理完成：{len(df)}条样本")
+        
+        # ========== 修改 3：正负样本均衡（保留原逻辑） ==========
         pos_df = df[df["target"] == 1]
         neg_df = df[df["target"] == 0]
         if len(pos_df) == 0 or len(neg_df) == 0:
@@ -166,7 +208,7 @@ def preprocess_data(raw_data):
             neg_df = neg_df.sample(n=sample_size, random_state=config.SEED)
             df_balanced = pd.concat([pos_df, neg_df]).sample(frac=1, random_state=config.SEED).reset_index(drop=True)
 
-        # 添加高斯噪声
+        # 添加高斯噪声（增强鲁棒性）
         noise = np.random.normal(0, 0.01, size=(df_balanced.shape[0], len(selected_feats)))
         df_balanced[selected_feats] = df_balanced[selected_feats] + noise
         df_balanced[selected_feats] = df_balanced[selected_feats].clip(0, 1)
@@ -175,7 +217,9 @@ def preprocess_data(raw_data):
         processed_data[platform] = {
             "features": df_balanced[selected_feats].values,
             "target": df_balanced["target"].values,
-            "user_id": df_balanced["reviewerID"].values
+            "user_id": df_balanced["reviewerID"].values,
+            "scaler": scaler,  # 保存该平台专用的 scaler
+            "is_long_tail": is_long_tail  # 标记是否为长尾分布
         }
         
         # 如果有额外目标类型，也保存
@@ -185,7 +229,10 @@ def preprocess_data(raw_data):
             processed_data[platform]["target_ranking"] = df_balanced["target_ranking"].values
         
         logger.info(
-            f"{platform}平台预处理完成：特征维度{len(selected_feats)}，样本量{len(df_balanced)}，正样本{sum(processed_data[platform]['target'])}，正样本比例={sum(processed_data[platform]['target'])/len(processed_data[platform]['target']):.2%}")
+            f"{platform}平台预处理完成：特征维度{len(selected_feats)}，样本量{len(df_balanced)}，"
+            f"正样本{sum(processed_data[platform]['target'])}，"
+            f"正样本比例={sum(processed_data[platform]['target'])/len(processed_data[platform]['target']):.2%}, "
+            f"长尾分布={is_long_tail}")
 
     return processed_data
 

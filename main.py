@@ -38,6 +38,16 @@ def main():
     if mmd_matrix is not None:
         logger.info(f"\nMMD Matrix:\n{mmd_matrix}")
 
+    logger.info("\n" + "=" * 60)
+    logger.info("Distribution Heterogeneity Summary")
+    logger.info("=" * 60)
+    for platform, cfg in config.PLATFORM_CONFIG.items():
+        logger.info(f"\n{platform}:")
+        logger.info(f"  - Feature Dimension: {cfg['feat_dim']}")
+        logger.info(f"  - Target Type: {cfg['target']}")
+        logger.info(f"  - Is Long-tail: {cfg.get('is_long_tail', False)}")
+        logger.info(f"  - Sample Ratio: {cfg.get('sample', 1.0)}")
+
     logger.info("\nAll experiments finished! Results saved in ./results directory.")
 
 
