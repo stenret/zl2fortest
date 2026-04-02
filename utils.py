@@ -219,24 +219,37 @@ def count_model_parameters(model):
     }
 
 
-# 新增：计算多次实验的均值±标准差（论文统计学要求）
+# 新增：计算多次实验的均值 ± 标准差（论文统计学要求）
 def calculate_statistical_results(repeat_results):
     """
-    repeat_results: 列表，每个元素是单次实验的metrics字典
+    repeat_results: 列表，每个元素是单次实验的 metrics 字典
     返回：均值±标准差的字典
     """
-    metrics = repeat_results[0].keys() if repeat_results else []
+    if not repeat_results:
+        return {}
+    
+    # 获取所有键，排除非数值类型
+    metrics = []
+    for key in repeat_results[0].keys():
+        if key in ["repeat_idx", "model_type", "platform", "target_type"]:
+            continue
+        # 检查是否为数值类型
+        sample_val = repeat_results[0][key]
+        if isinstance(sample_val, (int, float)):
+            metrics.append(key)
+    
     stat_results = {}
-
+    
     for metric in metrics:
-        values = [r[metric] for r in repeat_results]
-        mean_val = np.mean(values)
-        std_val = np.std(values)
-        # 格式：均值±标准差（保留4位小数）
-        stat_results[f"{metric}_mean"] = round(mean_val, 4)
-        stat_results[f"{metric}_std"] = round(std_val, 4)
-        stat_results[f"{metric}_formatted"] = f"{mean_val:.4f}±{std_val:.4f}"
-
+        values = [r[metric] for r in repeat_results if isinstance(r.get(metric), (int, float))]
+        if len(values) > 0:
+            mean_val = np.mean(values)
+            std_val = np.std(values)
+            # 格式：均值 ± 标准差（保留 4 位小数）
+            stat_results[f"{metric}_mean"] = round(mean_val, 4)
+            stat_results[f"{metric}_std"] = round(std_val, 4)
+            stat_results[f"{metric}_formatted"] = f"{mean_val:.4f}±{std_val:.4f}"
+    
     return stat_results
 
 

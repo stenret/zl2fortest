@@ -80,3 +80,11 @@ BASELINE_MODELS = [
     "OnlyMMD",          # 仅 MMD 损失（无重构）
     "LightGCN_Baseline" # 轻量化 SOTA 对比
 ]
+
+# ========== 联邦蒸馏配置（新增） ==========
+USE_FEDERATED_DISTILL = False  # 是否启用联邦蒸馏模式
+FEDERATED_ROUNDS = 15          # 联邦训练轮数
+LOCAL_EPOCHS = 3               # 每轮本地训练 epoch 数
+DISTILL_TEMPERATURE = 3.0      # 蒸馏温度（软化概率分布，值越大分布越平滑）
+DISTILL_ALPHA = 0.7            # 蒸馏损失权重（0.5-0.9 推荐）
+PRIVACY_NOISE_STD = 0.0        # 添加到上传参数的噪声标准差（差分隐私）
