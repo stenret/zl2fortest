@@ -1,0 +1,10 @@
+baseline_model,platform,target_type,total_params_million,train_time_seconds,max_memory_mb,AUC,F1-score,NDCG
+RawFeature,Books,CTR,0.001,246.96,48.22,0.8711996160590924,0.8614950634696756,
+RawFeature,Electronics,CVR_Classification,0.001,140.3,47.9,0.6546272816863397,0.5875165125495377,
+RawFeature,Clothing,Interaction,0.0,24.55,47.9,,,0.8701
+OnlyMMD,Books,CTR,0.02,14.8,48.27,0.8686285238867042,0.862689926842994,
+OnlyMMD,Electronics,CVR_Classification,0.02,43.86,48.42,0.653323350490077,0.5803986710963455,
+OnlyMMD,Clothing,Interaction,0.02,37.42,48.42,,,0.7952
+LightGCN_Baseline,Books,CTR,0.018,9.33,48.55,0.8203311822457221,0.6854362182829337,
+LightGCN_Baseline,Electronics,CVR_Classification,0.018,23.21,48.55,0.6414213366992978,0.5865573770491803,
+LightGCN_Baseline,Clothing,Interaction,0.017,9.32,48.55,,,0.8701

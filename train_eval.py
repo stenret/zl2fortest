@@ -259,7 +259,8 @@ def evaluate_model(model, dataloader, platform, device, model_name="CustomModel"
 def train_platform_model_with_mmd(model, dataloaders, target_platform, device,
                                    use_decoder=True, use_mmd=True):
     """
-    跨平台训练：使用其他平台的特征作为 MMD 对齐目标
+    跨平台训练：使用其他平台的全局特征（非原始特征）作为 MMD 对齐目标
+    方案 2：全局特征蒸馏（保护隐私，不传递原始数据）
     :param model: 模型
     :param dataloaders: 所有平台的数据加载器字典
     :param target_platform: 当前训练的目标平台
@@ -275,8 +276,32 @@ def train_platform_model_with_mmd(model, dataloaders, target_platform, device,
     loss_history = {"train": [], "val": []}
     start_time = time.time()
 
-    # 获取源平台特征（用于 MMD 对齐）
+    # 获取源平台列表
     source_platforms = [p for p in config.PLATFORM_CONFIG.keys() if p != target_platform and p in dataloaders]
+    
+    # 获取平台特征维度配置
+    platform_feat_dims = {p: cfg["feat_dim"] for p, cfg in config.PLATFORM_CONFIG.items()}
+    
+    # ========== 方案 2 核心：预加载源平台的教师模型（用于提取全局特征） ==========
+    teacher_models = {}
+    if use_mmd and source_platforms:
+        for source_p in source_platforms:
+            # 尝试加载源平台的最佳模型
+            teacher_model = FeatureDistillationModel(platform_feat_dims).to(device)
+            teacher_model_path = os.path.join(
+                config.MODEL_DIR, 
+                f"{source_p}_best_model.pth"
+            )
+            
+            if os.path.exists(teacher_model_path):
+                teacher_model.load_state_dict(
+                    torch.load(teacher_model_path, map_location=device)
+                )
+                teacher_model.eval()  # 设为评估模式
+                teacher_models[source_p] = teacher_model
+                logger.info(f"已加载{source_p}教师模型用于全局特征蒸馏")
+            else:
+                logger.warning(f"{source_p}模型不存在，将回退到原始特征蒸馏")
 
     for epoch in range(config.EPOCHS):
         # 训练阶段
@@ -287,16 +312,37 @@ def train_platform_model_with_mmd(model, dataloaders, target_platform, device,
             X_batch, y_batch = X_batch.to(device), y_batch.to(device)
             optimizer.zero_grad()
 
-            # 从源平台随机采样一个批次的特征
-            cross_platform_feat = None
-            if use_mmd and source_platforms:
+            # ========== 方案 2 核心：从源平台获取全局特征（非原始特征） ==========
+            cross_platform_global_feat = None
+            
+            if use_mmd and teacher_models:
+                # 随机选择一个教师模型
+                source_platform = random.choice(list(teacher_models.keys()))
+                teacher_model = teacher_models[source_platform]
+                
+                # 从源平台训练集采样一个 batch 的原始数据
+                source_loader = dataloaders[source_platform]["train"]
+                source_batch = next(iter(source_loader))
+                source_data = source_batch[0].to(device)  # 仅在此处短暂使用原始数据
+                
+                # 【关键】通过教师模型提取全局特征（不暴露原始数据给学生模型）
+                with torch.no_grad():
+                    teacher_global_feat, _, _ = teacher_model.forward(
+                        source_platform, 
+                        source_data
+                    )
+                    # teacher_global_feat: [batch_size, 128]  ← 已经是抽象的全局特征
+                
+                cross_platform_global_feat = teacher_global_feat
+                
+            elif use_mmd and source_platforms:
+                # 回退方案：如果没有教师模型，使用原始特征（方案 1）
                 source_platform = random.choice(source_platforms)
                 source_loader = dataloaders[source_platform]["train"]
-                # 取一个 batch 作为跨平台特征
                 source_batch = next(iter(source_loader))
                 cross_platform_feat = source_batch[0].to(device)
 
-            # 计算损失
+            # ========== 前向传播 ==========
             global_feat, recon_feat, pred = model.forward(target_platform, X_batch)
 
             # 1. 重构损失（可选）
@@ -308,8 +354,13 @@ def train_platform_model_with_mmd(model, dataloaders, target_platform, device,
             # 2. 下游任务损失
             task_loss = F.binary_cross_entropy(pred.squeeze(), y_batch.float())
 
-            # 3. MMD 损失（可选）
-            if use_mmd and cross_platform_feat is not None:
+            # 3. MMD 损失（对齐全局特征，而非原始特征）
+            if cross_platform_global_feat is not None:
+                # 方案 2：对齐全局特征
+                mmd_kernel = model.mmd_loss(global_feat, cross_platform_global_feat)
+                mmd_loss = mmd_kernel.mean()
+            elif 'cross_platform_feat' in locals():
+                # 回退方案：对齐原始特征
                 mmd_kernel = model.mmd_loss(global_feat, cross_platform_feat)
                 mmd_loss = mmd_kernel.mean()
             else:
@@ -345,7 +396,22 @@ def train_platform_model_with_mmd(model, dataloaders, target_platform, device,
 
                 task_loss = F.binary_cross_entropy(pred.squeeze(), y_batch.float())
 
-                if use_mmd and source_platforms:
+                # 验证阶段的 MMD 损失处理
+                if use_mmd and teacher_models:
+                    source_platform = random.choice(list(teacher_models.keys()))
+                    teacher_model = teacher_models[source_platform]
+                    source_batch = next(iter(dataloaders[source_platform]["val"]))
+                    source_data = source_batch[0].to(device)
+                    
+                    with torch.no_grad():
+                        cross_platform_global_feat, _, _ = teacher_model.forward(
+                            source_platform, 
+                            source_data
+                        )
+                    
+                    mmd_kernel = model.mmd_loss(global_feat, cross_platform_global_feat)
+                    mmd_loss = mmd_kernel.mean()
+                elif use_mmd and source_platforms:
                     source_platform = random.choice(source_platforms)
                     source_batch = next(iter(dataloaders[source_platform]["val"]))
                     cross_platform_feat = source_batch[0].to(device)

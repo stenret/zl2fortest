@@ -1,0 +1,13 @@
+experiment,platform,target_type,AUC,F1-score,NDCG
+Full Model,Books,CTR,0.8710837861356149,0.862039898847991,
+Full Model,Electronics,CVR_Classification,0.6529768465610838,0.5955470126541725,
+Full Model,Clothing,Interaction,,,0.8486
+Without Platform Decoder,Books,CTR,0.8706675872170263,0.8623595505617977,
+Without Platform Decoder,Electronics,CVR_Classification,0.6540251030791213,0.5868066951099442,
+Without Platform Decoder,Clothing,Interaction,,,0.8048
+Without MMD Loss,Books,CTR,0.8712110329870337,0.8605307735742519,
+Without MMD Loss,Electronics,CVR_Classification,0.6538496286967868,0.588949008034104,
+Without MMD Loss,Clothing,Interaction,,,0.8237
+Without Downstream Task,Books,CTR,0.6933384093686896,0.0,
+Without Downstream Task,Electronics,CVR_Classification,0.4277736426848779,0.6666666666666666,
+Without Downstream Task,Clothing,Interaction,,,0.8365
